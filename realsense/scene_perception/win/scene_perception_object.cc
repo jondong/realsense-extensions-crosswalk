@@ -11,6 +11,7 @@
 #include "base/files/scoped_temp_dir.h"
 #include "base/logging.h"
 #include "realsense/common/win/common_utils.h"
+#include "realsense/scene_perception/win/scene_perception_command.h"
 
 namespace {
 using namespace realsense::common; // NOLINT
@@ -98,8 +99,7 @@ ScenePerceptionObject::ScenePerceptionObject() :
     scene_perception_(NULL),
     block_meshing_data_(NULL),
     surface_voxels_data_(NULL),
-    latest_color_image_(NULL),
-    latest_depth_image_(NULL) {
+    command_queue_(this) {
   last_meshing_time_ = base::TimeTicks::Now();
 
   // Size and framte rate for depth and color images.
@@ -218,25 +218,10 @@ ScenePerceptionObject::~ScenePerceptionObject() {
   if (state_ != IDLE) {
     OnDestroy(NULL);
   }
-
-  sample_message_.reset();
-  volume_preview_message_.reset();
-  vertices_normals_message_.reset();
-  meshing_data_message_.reset();
-  latest_vertices_.reset();
-  latest_normals_.reset();
 }
 
 void ScenePerceptionObject::ReleaseResources() {
   DCHECK_EQ(sensemanager_thread_.message_loop(), base::MessageLoop::current());
-  if (latest_color_image_) {
-    latest_color_image_->Release();
-    latest_color_image_ = NULL;
-  }
-  if (latest_depth_image_) {
-    latest_depth_image_->Release();
-    latest_depth_image_ = NULL;
-  }
   if (block_meshing_data_) {
     block_meshing_data_->Release();
     block_meshing_data_ = NULL;
@@ -493,105 +478,15 @@ void ScenePerceptionObject::OnRunPipeline() {
     state_ = IDLE;
     return;
   }
-
-  PXCCapture::Sample *sample = sense_manager_->QueryScenePerceptionSample();
-  if (!sample) {
-    // If the SP module is paused, the sample will be NULL.
-    // Query the raw color/depth images to support live preview and
-    // calculation of scene quality
-    sample = sense_manager_->QuerySample();
-  }
-
-  if (!sample || !sample->color || !sample->depth) {
-    triggerError("Failed to query sample.");
-
-    ReleaseResources();
-    state_ = IDLE;
-    return;
-  }
-
-  // Keep color and depth images.
-  // Allocate memory for images if necessary.
-  if (!latest_color_image_) {
-    PXCImage::ImageInfo image_info;
-    memset(&image_info, 0, sizeof(image_info));
-    image_info.width = sample->color->QueryInfo().width;
-    image_info.height = sample->color->QueryInfo().height;
-    image_info.format = PXCImage::PIXEL_FORMAT_RGB32;
-    latest_color_image_ = session_->CreateImage(&image_info);
-  }
-
-  if (!latest_depth_image_) {
-    PXCImage::ImageInfo image_info;
-    memset(&image_info, 0, sizeof(image_info));
-    image_info.width = sample->depth->QueryInfo().width;
-    image_info.height = sample->depth->QueryInfo().height;
-    image_info.format = PXCImage::PIXEL_FORMAT_DEPTH;
-    latest_depth_image_ = session_->CreateImage(&image_info);
-  }
-
-  // Copy the images.
-  latest_color_image_->CopyImage(sample->color);
-  latest_depth_image_->CopyImage(sample->depth);
-
-  // Get the depth quality.
-  float quality = 0.0;
-  quality = scene_perception_->CheckSceneQuality(sample);
-
-  if ((state_ == INITIALIZED) && checking_event_on_) {
-    CheckingEvent event;
-    event.quality = quality;
-    scoped_ptr<base::ListValue> eventData(new base::ListValue);
-    eventData->Append(event.ToValue().release());
-
-    DispatchEvent("checking", eventData.Pass());
-  }
-
-  if (state_ == STARTED) {
-    PXCScenePerception::TrackingAccuracy accuracy;
-    accuracy = scene_perception_->QueryTrackingAccuracy();
-    float pose[12];
-    scene_perception_->GetCameraPose(pose);
-
-    if (sampleprocessed_event_on_) {
-      SampleProcessedEvent event;
-      event.quality = quality;
-      event.accuracy = toJsAccuracy(accuracy);
-      for (int i = 0; i < 12; ++i) {
-        event.camera_pose.push_back(pose[i]);
-      }
-      scoped_ptr<base::ListValue> eventData(new base::ListValue);
-      eventData->Append(event.ToValue().release());
-
-      DispatchEvent("sampleprocessed", eventData.Pass());
-    }
-
-    if (meshupdated_event_on_
-        && !doing_meshing_updating_
-        && scene_perception_->IsReconstructionUpdated()) {
-      DispatchEvent("meshupdated");
-    }
-
-    // Keep vertices from current camera pose.
-    // PXCPoint3DF32 * internalWidth * internalHeight.
-    // PXCPoint3DF32 = [float x, float y, float z]
-    if (!latest_vertices_) {
-      latest_vertices_.reset(new uint8[3 * sizeof(float) *
-          sp_intrinsics_.imageSize.width * sp_intrinsics_.imageSize.height]);
-    }
-    scene_perception_->GetVertices(
-        reinterpret_cast<PXCPoint3DF32*>(latest_vertices_.get()));
-
-    // Keep normals from current camera pose.
-    if (!latest_normals_) {
-      latest_normals_.reset(new uint8[3 * sizeof(float) *
-          sp_intrinsics_.imageSize.width * sp_intrinsics_.imageSize.height]);
-    }
-    scene_perception_->GetNormals(
-        reinterpret_cast<PXCPoint3DF32*>(latest_normals_.get()));
-  }
-
+  command_queue_.ExecutePendingCommands();
   sense_manager_->ReleaseFrame();
+
+  sensemanager_thread_.message_loop()->PostTask(
+      FROM_HERE,
+      base::Bind(&CommandQueue::AppendCommand,
+                 base::Unretained(&command_queue_),
+                 base::Passed(scoped_ptr<Command>(
+                     new EventCommand(this)))));
 
   sensemanager_thread_.message_loop()->PostTask(
       FROM_HERE,
@@ -820,33 +715,22 @@ void ScenePerceptionObject::OnGetVertices(
 
   sensemanager_thread_.message_loop()->PostTask(
       FROM_HERE,
-      base::Bind(&ScenePerceptionObject::DoCopyVertices,
-                 base::Unretained(this),
-                 base::Passed(&info)));
+      base::Bind(&CommandQueue::AppendCommand,
+                 base::Unretained(&command_queue_),
+                 base::Passed(scoped_ptr<Command>(
+                     new GetVerticesCommand(std::move(info), this)))));
 }
 
-void ScenePerceptionObject::DoCopyVertices(
-    scoped_ptr<XWalkExtensionFunctionInfo> info) {
+void ScenePerceptionObject::ProcessGetVerticesCommand(
+    scoped_ptr<XWalkExtensionFunctionInfo> info, PXCCapture::Sample* sample) {
   DCHECK_EQ(sensemanager_thread_.message_loop(), base::MessageLoop::current());
 
-  if (!latest_vertices_) {
+  if (state_ != STARTED) {
     VerticesOrNormals data;
     info->PostResult(GetVertices::Results::Create(
-        data, std::string("No available vertices or in wrong state.")));
+        data, std::string("Wrong state.")));
     return;
   }
-
-  DoCopyVerticesOrNormals(latest_vertices_.Pass());
-
-  scoped_ptr<base::ListValue> result(new base::ListValue());
-  result->Append(base::BinaryValue::CreateWithCopiedBuffer(
-        reinterpret_cast<const char*>(vertices_normals_message_.get()),
-        vertices_normals_message_size_));
-  info->PostResult(result.Pass());
-}
-
-void ScenePerceptionObject::DoCopyVerticesOrNormals(scoped_ptr<uint8[]> data) {
-  DCHECK_EQ(sensemanager_thread_.message_loop(), base::MessageLoop::current());
 
   // Format of vertices or normals:
   // Call id(int),
@@ -854,20 +738,22 @@ void ScenePerceptionObject::DoCopyVerticesOrNormals(scoped_ptr<uint8[]> data) {
   // data buffer (PXCPoint3DF32 buffer)
   //     [float x, float y, float z] * width * height
   size_t headLength = 3 * sizeof(int);
-  size_t width = sp_intrinsics_.imageSize.width;
-  size_t height = sp_intrinsics_.imageSize.height;
-  size_t dataLength = 3 * sizeof(float) * width * height;
-  if (!vertices_normals_message_) {
-    vertices_normals_message_size_ = headLength + dataLength;
-    vertices_normals_message_.reset(
-        new uint8[vertices_normals_message_size_]);
-  }
-  int* int_array = reinterpret_cast<int*>(vertices_normals_message_.get());
+  size_t dataLength = 3 * sizeof(float) * sp_intrinsics_.imageSize.width
+                      * sp_intrinsics_.imageSize.height;
+  size_t vertices_message_size = headLength + dataLength;
+  scoped_ptr<uint8[]> vertices_message(new uint8[vertices_message_size]);
+  int* int_array = reinterpret_cast<int*>(vertices_message.get());
   int_array[1] = sp_intrinsics_.imageSize.width;
   int_array[2] = sp_intrinsics_.imageSize.height;
   char* data_offset =
-      reinterpret_cast<char*>(vertices_normals_message_.get()) + headLength;
-  memcpy(data_offset, reinterpret_cast<char*>(data.get()), dataLength);
+      reinterpret_cast<char*>(vertices_message.get()) + headLength;
+  scene_perception_->GetVertices(reinterpret_cast<PXCPoint3DF32*>(data_offset));
+
+  scoped_ptr<base::ListValue> result(new base::ListValue());
+  result->Append(base::BinaryValue::CreateWithCopiedBuffer(
+        reinterpret_cast<const char*>(vertices_message.get()),
+        vertices_message_size));
+  info->PostResult(result.Pass());
 }
 
 void ScenePerceptionObject::OnGetNormals(
@@ -881,28 +767,44 @@ void ScenePerceptionObject::OnGetNormals(
 
   sensemanager_thread_.message_loop()->PostTask(
       FROM_HERE,
-      base::Bind(&ScenePerceptionObject::DoCopyNormals,
-                 base::Unretained(this),
-                 base::Passed(&info)));
+      base::Bind(&CommandQueue::AppendCommand,
+                 base::Unretained(&command_queue_),
+                 base::Passed(scoped_ptr<Command>(
+                     new GetNormalsCommand(std::move(info), this)))));
 }
 
-void ScenePerceptionObject::DoCopyNormals(
-    scoped_ptr<XWalkExtensionFunctionInfo> info) {
+void ScenePerceptionObject::ProcessGetNormalsCommand(
+    scoped_ptr<XWalkExtensionFunctionInfo> info, PXCCapture::Sample* sample) {
   DCHECK_EQ(sensemanager_thread_.message_loop(), base::MessageLoop::current());
 
-  if (!latest_normals_) {
+  if (state_ != STARTED) {
     VerticesOrNormals data;
     info->PostResult(GetVertices::Results::Create(
-        data, std::string("No available vertices or in wrong state.")));
+        data, std::string("Wrong state.")));
     return;
   }
 
-  DoCopyVerticesOrNormals(latest_normals_.Pass());
+  // Format of vertices or normals:
+  // Call id(int),
+  // width(int), height(int),
+  // data buffer (PXCPoint3DF32 buffer)
+  //     [float x, float y, float z] * width * height
+  size_t headLength = 3 * sizeof(int);
+  size_t dataLength = 3 * sizeof(float) * sp_intrinsics_.imageSize.width
+                      * sp_intrinsics_.imageSize.height;
+  size_t normals_message_size = headLength + dataLength;
+  scoped_ptr<uint8[]> normals_message(new uint8[normals_message_size]);
+  int* int_array = reinterpret_cast<int*>(normals_message.get());
+  int_array[1] = sp_intrinsics_.imageSize.width;
+  int_array[2] = sp_intrinsics_.imageSize.height;
+  char* data_offset =
+      reinterpret_cast<char*>(normals_message.get()) + headLength;
+  scene_perception_->GetNormals(reinterpret_cast<PXCPoint3DF32*>(data_offset));
 
   scoped_ptr<base::ListValue> result(new base::ListValue());
   result->Append(base::BinaryValue::CreateWithCopiedBuffer(
-        reinterpret_cast<const char*>(vertices_normals_message_.get()),
-        vertices_normals_message_size_));
+        reinterpret_cast<const char*>(normals_message.get()),
+        normals_message_size));
   info->PostResult(result.Pass());
 }
 
@@ -982,16 +884,16 @@ void ScenePerceptionObject::DoMeshingUpdateOnMeshingThread(
   const int faces_byte_length = num_of_faces * 3 * sizeof(int);
   const int colors_byte_length = num_of_vertices * 3 * sizeof(unsigned char);
 
-  meshing_data_message_size_ =
+  size_t meshing_data_message_size =
       header_byte_length
       + num_of_blockmeshes * blockmesh_byte_length
       + vertices_byte_length
       + faces_byte_length
       + colors_byte_length;
 
-  meshing_data_message_.reset(
-      new uint8[meshing_data_message_size_]);
-  int* int_array = reinterpret_cast<int*>(meshing_data_message_.get());
+  scoped_ptr<uint8[]> meshing_data_message(
+      new uint8[meshing_data_message_size]);
+  int* int_array = reinterpret_cast<int*>(meshing_data_message.get());
   int_array[1] = num_of_blockmeshes;
   int_array[2] = num_of_vertices;
   int_array[3] = num_of_faces;
@@ -999,7 +901,7 @@ void ScenePerceptionObject::DoMeshingUpdateOnMeshingThread(
   PXCBlockMeshingData::PXCBlockMesh *block_mesh_data =
       block_meshing_data_->QueryBlockMeshes();
   char* block_meshes_offset =
-      reinterpret_cast<char*>(meshing_data_message_.get()) +
+      reinterpret_cast<char*>(meshing_data_message.get()) +
       header_byte_length;
   int* block_meshes_array = reinterpret_cast<int*>(block_meshes_offset);
   for (int i = 0; i < num_of_blockmeshes; ++i, ++block_mesh_data) {
@@ -1027,8 +929,8 @@ void ScenePerceptionObject::DoMeshingUpdateOnMeshingThread(
 
   scoped_ptr<base::ListValue> result(new base::ListValue());
   result->Append(base::BinaryValue::CreateWithCopiedBuffer(
-        reinterpret_cast<const char*>(meshing_data_message_.get()),
-        meshing_data_message_size_));
+        reinterpret_cast<const char*>(meshing_data_message.get()),
+        meshing_data_message_size));
   info->PostResult(result.Pass());
 
   // Notice the scenemanager thread that mesh data updating done.
@@ -1294,6 +1196,26 @@ void ScenePerceptionObject::OnSetMeshingRegion(
   info->PostResult(CreateSuccessResult());
 }
 
+PXCCapture::Sample* ScenePerceptionObject::QuerySample() {
+  DCHECK_EQ(sensemanager_thread_.message_loop(), base::MessageLoop::current());
+  PXCCapture::Sample *sample = sense_manager_->QueryScenePerceptionSample();
+  if (!sample) {
+    // If the SP module is paused, the sample will be NULL.
+    // Query the raw color/depth images to support live preview and
+    // calculation of scene quality
+    sample = sense_manager_->QuerySample();
+  }
+
+  if (!sample || !sample->color || !sample->depth) {
+    triggerError("Failed to query sample.");
+
+    ReleaseResources();
+    state_ = IDLE;
+    return 0;
+  }
+  return sample;
+}
+
 /** ---------------- Implementation for getters --------------**/
 void ScenePerceptionObject::OnGetSample(
     scoped_ptr<XWalkExtensionFunctionInfo> info) {
@@ -1306,23 +1228,18 @@ void ScenePerceptionObject::OnGetSample(
 
   sensemanager_thread_.message_loop()->PostTask(
       FROM_HERE,
-      base::Bind(&ScenePerceptionObject::DoCopySample,
-                 base::Unretained(this),
-                 base::Passed(&info)));
+      base::Bind(&CommandQueue::AppendCommand,
+                 base::Unretained(&command_queue_),
+                 base::Passed(scoped_ptr<Command>(
+                     new GetSampleCommand(std::move(info), this)))));
 }
 
-void ScenePerceptionObject::DoCopySample(
-    scoped_ptr<XWalkExtensionFunctionInfo> info) {
+void ScenePerceptionObject::ProcessGetSampleCommand(
+    scoped_ptr<XWalkExtensionFunctionInfo> info, PXCCapture::Sample* sample) {
   DCHECK_EQ(sensemanager_thread_.message_loop(), base::MessageLoop::current());
-  if (!(latest_color_image_ && latest_depth_image_)) {
-    Sample sample;
-    info->PostResult(GetSample::Results::Create(
-        sample, std::string("No valiable sample.")));
-    return;
-  }
 
-  PXCImage* color = latest_color_image_;
-  PXCImage* depth = latest_depth_image_;
+  PXCImage* color = sample->color;
+  PXCImage* depth = sample->depth;
 
   PXCImage::ImageInfo color_info = color->QueryInfo();
   PXCImage::ImageInfo depth_info = depth->QueryInfo();
@@ -1333,13 +1250,12 @@ void ScenePerceptionObject::DoCopySample(
   // color (int8 buffer), depth (int16 buffer)
   int cDataOffset = 4 * 5;
   int dDataOffset = cDataOffset + color_info.width * color_info.height * 4;
-  if (!sample_message_) {
-    sample_message_size_ = dDataOffset
+
+  size_t sample_message_size = dDataOffset
       + depth_info.width * depth_info.height * 2;
-    sample_message_.reset(
-        new uint8[sample_message_size_]);
-  }
-  int* int_array = reinterpret_cast<int*>(sample_message_.get());
+  scoped_ptr<uint8[]> sample_message(new uint8[sample_message_size]);
+
+  int* int_array = reinterpret_cast<int*>(sample_message.get());
   int_array[1] = color_info.width;
   int_array[2] = color_info.height;
   int_array[3] = depth_info.width;
@@ -1347,13 +1263,13 @@ void ScenePerceptionObject::DoCopySample(
 
   copyImageRGB32(color,
          reinterpret_cast<uint8_t*>(
-         sample_message_.get() + cDataOffset));
+         sample_message.get() + cDataOffset));
 
   PXCImage::ImageData depth_data;
   pxcStatus status = depth->AcquireAccess(
       PXCImage::ACCESS_READ, PXCImage::PIXEL_FORMAT_DEPTH, &depth_data);
   uint16_t* uint16_array = reinterpret_cast<uint16_t*>(
-      sample_message_.get() + dDataOffset);
+      sample_message.get() + dDataOffset);
   if (status >= PXC_STATUS_NO_ERROR) {
     int k = 0;
     for (int y = 0; y < depth_info.height; ++y) {
@@ -1369,9 +1285,52 @@ void ScenePerceptionObject::DoCopySample(
 
   scoped_ptr<base::ListValue> result(new base::ListValue());
   result->Append(base::BinaryValue::CreateWithCopiedBuffer(
-        reinterpret_cast<const char*>(sample_message_.get()),
-        sample_message_size_));
+        reinterpret_cast<const char*>(sample_message.get()),
+        sample_message_size));
   info->PostResult(result.Pass());
+}
+
+void ScenePerceptionObject::ProcessEventCommand(PXCCapture::Sample* sample) {
+  DCHECK_EQ(sensemanager_thread_.message_loop(), base::MessageLoop::current());
+
+  // Get the depth quality.
+  float quality = 0.0;
+  quality = scene_perception_->CheckSceneQuality(sample);
+
+  if ((state_ == INITIALIZED) && checking_event_on_) {
+    CheckingEvent event;
+    event.quality = quality;
+    scoped_ptr<base::ListValue> eventData(new base::ListValue);
+    eventData->Append(event.ToValue().release());
+
+    DispatchEvent("checking", eventData.Pass());
+  }
+
+  if (state_ == STARTED) {
+    PXCScenePerception::TrackingAccuracy accuracy;
+    accuracy = scene_perception_->QueryTrackingAccuracy();
+    float pose[12];
+    scene_perception_->GetCameraPose(pose);
+
+    if (sampleprocessed_event_on_) {
+      SampleProcessedEvent event;
+      event.quality = quality;
+      event.accuracy = toJsAccuracy(accuracy);
+      for (int i = 0; i < 12; ++i) {
+        event.camera_pose.push_back(pose[i]);
+      }
+      scoped_ptr<base::ListValue> eventData(new base::ListValue);
+      eventData->Append(event.ToValue().release());
+
+      DispatchEvent("sampleprocessed", eventData.Pass());
+    }
+
+    if (meshupdated_event_on_
+        && !doing_meshing_updating_
+        && scene_perception_->IsReconstructionUpdated()) {
+      DispatchEvent("meshupdated");
+    }
+  }
 }
 
 void ScenePerceptionObject::DoQueryVolumePreview(
@@ -1399,28 +1358,27 @@ void ScenePerceptionObject::DoQueryVolumePreview(
   // RGBA_data (int8 buffer)
   PXCImage::ImageInfo imageInfo = vPreview->QueryInfo();
   int dataOffset = 3 * sizeof(int);
-  // Allocate the buffer if needed.
-  if (!volume_preview_message_) {
-    size_t internalSize =
-      sp_intrinsics_.imageSize.width * sp_intrinsics_.imageSize.height;
-    volume_preview_message_size_ = dataOffset + internalSize * 4;
-    volume_preview_message_.reset(
-        new uint8[volume_preview_message_size_]);
-  }
-  int* int_array = reinterpret_cast<int*>(volume_preview_message_.get());
+
+  size_t internalSize =
+    sp_intrinsics_.imageSize.width * sp_intrinsics_.imageSize.height;
+  size_t volume_preview_message_size = dataOffset + internalSize * 4;
+  scoped_ptr<uint8[]> volume_preview_message(
+      new uint8[volume_preview_message_size]);
+
+  int* int_array = reinterpret_cast<int*>(volume_preview_message.get());
   int_array[1] = imageInfo.width;
   int_array[2] = imageInfo.height;
 
   copyImageRGB32(vPreview,
          reinterpret_cast<uint8_t*>(
-         volume_preview_message_.get() + dataOffset));
+         volume_preview_message.get() + dataOffset));
 
   // Need to release to image.
   vPreview->Release();
   scoped_ptr<base::ListValue> result(new base::ListValue());
   result->Append(base::BinaryValue::CreateWithCopiedBuffer(
-        reinterpret_cast<const char*>(volume_preview_message_.get()),
-        volume_preview_message_size_));
+        reinterpret_cast<const char*>(volume_preview_message.get()),
+        volume_preview_message_size));
   info->PostResult(result.Pass());
 }
 

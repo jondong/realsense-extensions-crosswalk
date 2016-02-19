@@ -14,6 +14,7 @@
 #include "base/message_loop/message_loop_proxy.h"
 #include "base/time/time.h"
 #include "base/threading/thread.h"
+#include "realsense/common/win/command_queue.h"
 #include "third_party/libpxc/include/pxcsceneperception.h"
 #include "third_party/libpxc/include/pxcsensemanager.h"
 #include "xwalk/common/event_target.h"
@@ -24,7 +25,8 @@ namespace scene_perception {
 using namespace realsense::jsapi::scene_perception; // NOLINT
 using xwalk::common::XWalkExtensionFunctionInfo; // NOLINT
 
-class ScenePerceptionObject : public xwalk::common::EventTarget {
+class ScenePerceptionObject
+  : public xwalk::common::EventTarget, realsense::common::CommandQueueDelegate {
  public:
   ScenePerceptionObject();
   ~ScenePerceptionObject() override;
@@ -32,6 +34,18 @@ class ScenePerceptionObject : public xwalk::common::EventTarget {
   // EventTarget implementation.
   void StartEvent(const std::string& type) override;
   void StopEvent(const std::string& type) override;
+
+  // CommandQueueDelegate implementation.
+  virtual PXCCapture::Sample* QuerySample();
+
+  // Command process functions.
+  void ProcessGetSampleCommand(scoped_ptr<XWalkExtensionFunctionInfo> info,
+                               PXCCapture::Sample* sample);
+  void ProcessEventCommand(PXCCapture::Sample* sample);
+  void ProcessGetVerticesCommand(scoped_ptr<XWalkExtensionFunctionInfo> info,
+                                 PXCCapture::Sample* sample);
+  void ProcessGetNormalsCommand(scoped_ptr<XWalkExtensionFunctionInfo> info,
+                                PXCCapture::Sample* sample);
 
  private:
   // Controllers.
@@ -115,13 +129,6 @@ class ScenePerceptionObject : public xwalk::common::EventTarget {
       scoped_ptr<XWalkExtensionFunctionInfo> info);
   void DoSetCameraPose(
       scoped_ptr<XWalkExtensionFunctionInfo> info);
-  void DoCopySample(
-      scoped_ptr<XWalkExtensionFunctionInfo> info);
-  void DoCopyVertices(
-      scoped_ptr<XWalkExtensionFunctionInfo> info);
-  void DoCopyNormals(
-      scoped_ptr<XWalkExtensionFunctionInfo> info);
-  void DoCopyVerticesOrNormals(scoped_ptr<uint8[]> data);
 
   void DoCheckReconstructionFlag(
       scoped_ptr<XWalkExtensionFunctionInfo> info);
@@ -223,22 +230,7 @@ class ScenePerceptionObject : public xwalk::common::EventTarget {
   PXCScenePerception::MeshingUpdateInfo  meshing_update_info_;
   pxcBool b_fill_holes_;
 
-  PXCImage* latest_color_image_;
-  PXCImage* latest_depth_image_;
-  scoped_ptr<uint8[]> latest_vertices_;
-  scoped_ptr<uint8[]> latest_normals_;
-
-  scoped_ptr<uint8[]> sample_message_;
-  size_t sample_message_size_;
-
-  scoped_ptr<uint8[]> volume_preview_message_;
-  size_t volume_preview_message_size_;
-
-  scoped_ptr<uint8[]> vertices_normals_message_;
-  size_t vertices_normals_message_size_;
-
-  scoped_ptr<uint8[]> meshing_data_message_;
-  size_t meshing_data_message_size_;
+  common::CommandQueue command_queue_;
 };
 
 }  // namespace scene_perception

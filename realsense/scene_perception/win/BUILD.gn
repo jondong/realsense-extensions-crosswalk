@@ -15,6 +15,12 @@ xwalk_js2c("scene_perception_js") {
 
 shared_library("scene_perception") {
   sources = [
+    "../../common/win/command.cc",
+    "../../common/win/command.h",
+    "../../common/win/command_queue.cc",
+    "../../common/win/command_queue.h",
+    "scene_perception_command.cc",
+    "scene_perception_command.h",
     "scene_perception_extension.cc",
     "scene_perception_extension.h",
     "scene_perception_instance.cc",
